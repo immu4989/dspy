@@ -1,3 +1,6 @@
+import asyncio
+from unittest.mock import AsyncMock
+
 import pytest
 
 import dspy
@@ -332,3 +335,164 @@ def test_react_v2_native_parallel_tool_calls_are_requested_and_replayed():
 def test_react_v2_rejects_reserved_output_field_names(reserved):
     with pytest.raises(ValueError, match=reserved):
         dspy.ReActV2(f"question -> answer, {reserved}: str", tools=[])
+
+
+@pytest.mark.asyncio
+async def test_react_v2_async_loop_runs_mixed_tools_sequentially():
+    call_order = []
+
+    def sync_lookup(query: str) -> str:
+        call_order.append("sync_lookup")
+        return f"sync {query}"
+
+    async def async_lookup(query: str) -> str:
+        call_order.append("async_lookup")
+        return f"async {query}"
+
+    async def failing_lookup(query: str) -> str:
+        call_order.append("failing_lookup")
+        raise RuntimeError(f"cannot find {query}")
+
+    lm = dspy.utils.DummyLM(
+        [
+            {
+                "next_thought": "Use each available source.",
+                "tool_calls": dspy.ToolCalls.from_dict_list(
+                    [
+                        {"name": "sync_lookup", "args": {"query": "cats"}},
+                        {"name": "async_lookup", "args": {"query": "dogs"}},
+                        {"name": "failing_lookup", "args": {"query": "birds"}},
+                        {"name": "missing_lookup", "args": {"query": "fish"}},
+                    ]
+                ),
+            },
+            {
+                "next_thought": "I can answer now.",
+                "tool_calls": dspy.ToolCalls.from_dict_list(
+                    [{"name": "submit", "args": {"answer": "done"}}]
+                ),
+            },
+        ]
+    )
+
+    with dspy.context(lm=lm, adapter=dspy.ChatAdapter()):
+        pred = await dspy.ReActV2(
+            "question -> answer",
+            tools=[sync_lookup, async_lookup, failing_lookup],
+        ).acall(question="pets")
+
+    assert pred.answer == "done"
+    assert pred.termination_reason == "submit"
+    assert call_order == ["sync_lookup", "async_lookup", "failing_lookup"]
+    assert sum("question" in event for event in pred.history.messages) == 1
+
+    results = pred.history.messages[0]["tool_calls"].tool_call_results.tool_call_results
+    assert [result.call_id for result in results] == ["call_0_0", "call_0_1", "call_0_2", "call_0_3"]
+    assert [result.is_error for result in results] == [False, False, True, True]
+    assert results[0].value == "sync cats"
+    assert results[1].value == "async dogs"
+    assert "Execution error in failing_lookup" in results[2].value
+    assert "cannot find birds" in results[2].value
+    assert results[3].value == "Unknown tool: missing_lookup"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trigger", ["empty_tool_calls", "max_iters"])
+async def test_react_v2_async_forced_submit(trigger):
+    def lookup(query: str) -> str:
+        return f"found {query}"
+
+    if trigger == "empty_tool_calls":
+        first_tool_calls = dspy.ToolCalls(tool_calls=[])
+        tools = []
+        max_iters = 20
+    else:
+        first_tool_calls = dspy.ToolCalls.from_dict_list(
+            [{"name": "lookup", "args": {"query": "cats"}}]
+        )
+        tools = [lookup]
+        max_iters = 1
+
+    lm = ReasoningDummyLM(
+        [
+            {"next_thought": "Keep working.", "tool_calls": first_tool_calls},
+            {
+                "next_thought": "Forced final.",
+                "tool_calls": dspy.ToolCalls.from_dict_list(
+                    [{"name": "submit", "args": {"answer": "forced"}}]
+                ),
+            },
+        ]
+    )
+
+    with dspy.context(lm=lm, adapter=dspy.ChatAdapter()):
+        pred = await dspy.ReActV2("question -> answer", tools=tools).acall(
+            question="cats",
+            max_iters=max_iters,
+        )
+
+    assert pred.answer == "forced"
+    assert pred.termination_reason == "forced_submit"
+    assert lm.history[0]["kwargs"]["reasoning_effort"] == "low"
+    assert lm.history[1]["kwargs"].get("reasoning_effort") is None
+
+
+@pytest.mark.asyncio
+async def test_react_v2_async_forced_submit_after_parse_error():
+    react = dspy.ReActV2("question -> answer", tools=[])
+    react.react.acall = AsyncMock(
+        side_effect=[
+            ValueError("invalid tool calls"),
+            dspy.Prediction(
+                next_thought="Forced final.",
+                tool_calls=dspy.ToolCalls.from_dict_list(
+                    [{"name": "submit", "args": {"answer": "forced"}}]
+                ),
+            ),
+        ]
+    )
+
+    pred = await react.acall(question="cats")
+
+    assert pred.answer == "forced"
+    assert pred.termination_reason == "forced_submit"
+    assert react.react.acall.await_count == 2
+    assert react.react.acall.await_args_list[1].kwargs["config"]["tool_choice"]["function"]["name"] == "submit"
+
+
+@pytest.mark.asyncio
+async def test_react_v2_async_cancellation_propagates_without_recording_partial_turn():
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    history = dspy.History(messages=[])
+
+    async def wait_for_cancel() -> str:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    lm = dspy.utils.DummyLM(
+        [
+            {
+                "next_thought": "Wait for the tool.",
+                "tool_calls": dspy.ToolCalls.from_dict_list(
+                    [{"name": "wait_for_cancel", "args": {}}]
+                ),
+            }
+        ]
+    )
+    react = dspy.ReActV2("question -> answer", tools=[wait_for_cancel])
+
+    with dspy.context(lm=lm, adapter=dspy.ChatAdapter()):
+        task = asyncio.create_task(react.acall(question="cats", history=history))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert cancelled.is_set()
+    assert history.messages == []
+    assert len(lm.history) == 1
